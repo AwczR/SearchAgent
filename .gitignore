@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.pkl
+*.npy
+*.npz
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+myenv/
+*.pyenv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_save
+
+# Build / packaging
+build/
+dist/
+*.log
+*.pot
+*.pyc
+*.so
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Checkpoints / models
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Data (ignore only json, keep dir)
+data/*.json
+!data/.gitkeep
+
+# Cache
+.cache/
+*.mypy_cache/
+*.pytest_cache/
+*.coverage

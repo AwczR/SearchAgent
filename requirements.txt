@@ -1,0 +1,25 @@
+python-dotenv
+pydantic>=2
+fastapi 
+uvicorn
+
+langchain>=0.2
+langchain-openai
+langchain-core>=0.2
+langchain-community>=0.2
+langchain-siliconflow>=0.1.0    # 官方集成包  [oai_citation:7‡python.langchain.com](https://python.langchain.com/docs/integrations/providers/siliconflow/?utm_source=chatgpt.com) [oai_citation:8‡piwheels.org](https://www.piwheels.org/project/langchain-siliconflow?utm_source=chatgpt.com)
+
+httpx>=0.27
+
+# 外部搜索（至少选一个）
+tavily-python            # Tavily SDK  [oai_citation:9‡docs.tavily.com](https://docs.tavily.com/?utm_source=chatgpt.com)          # Jina Search/Reader  [oai_citation:12‡Jina AI](https://jina.ai/reader/?utm_source=chatgpt.com)
+
+# 向量库（选一）
+faiss-cpu
+# 或
+qdrant-client
+
+# 解析与清洗
+beautifulsoup4 
+lxml
+tiktoken
