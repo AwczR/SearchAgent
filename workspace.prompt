@@ -5,6 +5,7 @@ SearchAgent
 │   │   ├── agent0_intake.py
 │   │   ├── agent1_plan.py
 │   │   ├── agent2_filter.py
+│   │   ├── agent2b_clean.py
 │   │   └── agent3_write.py
 │   ├── llm
 │   │   ├── chat_sf.py
@@ -334,6 +335,133 @@ def select_docs(
             print(f"  · {i+1}. {d.title or d.url}  -> {d.url}")
 
     return kept
+app/agents/agent2b_clean.py
+# app/agents/agent2b_clean.py
+from typing import List
+from langchain_core.prompts import ChatPromptTemplate
+from app.llm.chat_sf import get_chat
+from app.llm.stream import stream_text
+from app.schema import Doc
+
+_SYS = ""
+_USER = """你是文本清洗器。对给定文本做“最小但有效”的清洗，仅输出清洗后的纯文本：
+- 删除：乱码、无意义字符块、导航/广告/版权尾注、冗余页眉页脚、过长重复行、base64/十六进制大段、无内容表格框线
+- 保留：正文要点、定义、结论、数据、公式（用纯文本保留）、标题与小标题、列表项
+- 规整：去重与空白，合并破碎的句子，保持段落可读；保留层级语义（标题→段落→列表）
+- 禁止：新增编造信息；解释说明；任何 JSON 或标记包装
+待清洗文本：
+{content}"""
+
+def clean_text(llm=None, content: str = "") -> str:
+    llm = llm or get_chat()
+    prompt = ChatPromptTemplate.from_messages([("system", _SYS), ("user", _USER)])
+    out = stream_text(prompt.format_messages(content=content), llm=llm)
+    return out.strip()
+
+def clean_docs(llm=None, docs: List[Doc] | None = None) -> List[Doc]:
+    if not docs:
+        return []
+    llm = llm or get_chat()
+    res: List[Doc] = []
+    for d in docs:
+        try:
+            c = clean_text(llm=llm, content=d.content or "")
+            d.content = c
+            d.meta = dict(d.meta or {})
+            d.meta["cleaned"] = True
+        except Exception as e:
+            d.meta = dict(d.meta or {})
+            d.meta["clean_error"] = str(e)
+        res.append(d)
+    return res
+app/agents/agent3_write.py
+# app/agents/agent3_write.py
+from __future__ import annotations
+from typing import List, Tuple
+from langchain_core.prompts import ChatPromptTemplate
+from app.llm.chat_sf import get_chat
+from app.llm.stream import stream_text
+from app.schema import Workspace, Doc
+
+_SYS = ""
+_USER = """你将基于“候选资料片段”回答“用户问题”。要求：
+- 直接给出答案，不要解释流程。
+- 不要在正文里写“参考文献/来源/链接”等字样。
+- 不要在正文里输出 URL，正文结束后我会自动附上来源列表。
+
+用户问题：
+{question}
+
+若有目标：
+{goal}
+
+候选资料片段（可能已被清洗，仅供作答，不要原样粘贴长段）：
+{contexts}
+"""
+
+def _mk_context(docs: List[Doc], max_chars_per_doc: int = 1200, max_docs: int = 8) -> Tuple[str, List[Doc]]:
+    """把文档裁剪成可读片段，并返回用于展示的 doc 列表（保持顺序、去重 URL）"""
+    seen = set()
+    ordered: List[Doc] = []
+    for d in docs:
+        u = (d.url or "").strip()
+        key = u or d.id
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(d)
+        if len(ordered) >= max_docs:
+            break
+
+    lines = []
+    for i, d in enumerate(ordered, 1):
+        title = d.title or (d.url or "untitled")
+        url = d.url or "(no url)"
+        body = (d.content or "").strip()
+        if len(body) > max_chars_per_doc:
+            body = body[:max_chars_per_doc].rstrip() + " ..."
+        lines.append(f"[{i}] {title}\nURL: {url}\n{body}\n")
+    return "\n".join(lines), ordered
+
+def _mk_refs(docs: List[Doc]) -> str:
+    """生成参考来源列表，带 URL。只展示有 URL 的条目。"""
+    refs = []
+    seen = set()
+    for i, d in enumerate(docs, 1):
+        title = d.title or d.url or "untitled"
+        url = (d.url or "").strip()
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        refs.append(f"{i}. [{title}]({url})")
+    if not refs:
+        return ""
+    return "\n\n参考来源：\n" + "\n".join(refs) + "\n"
+
+def compose_answer(llm=None, ws: Workspace | None = None) -> str:
+    if ws is None:
+        return "错误：Workspace 为空。"
+    llm = llm or get_chat()
+
+    # 组装上下文
+    contexts, used_docs = _mk_context(ws.docs or [])
+
+    # 调用 LLM 生成正文
+    prompt = ChatPromptTemplate.from_messages([("system", _SYS), ("user", _USER)])
+    body = stream_text(
+        prompt.format_messages(
+            question=ws.question,
+            goal=ws.goal or "(未设定)",
+            contexts=contexts or "(无)"
+        ),
+        llm=llm,
+    ).strip()
+
+    # 追加参考来源（只放 URL，不参与 LLM）
+    refs = _mk_refs(used_docs)
+    return body + (refs if refs else "")
 app/config.py
 import os
 from functools import lru_cache
@@ -497,6 +625,72 @@ def stream_json(messages: Iterable[BaseMessage], schema: Optional[Dict[str, Any]
         llm=llm,
     )
     return _safe_json(text)
+app/pipelines/main_loop.py
+# app/pipelines/main_loop.py
+from typing import List, Tuple
+from app.schema import Workspace, Doc, SubGoal, Decision
+from app.workspace import save_ws, add_docs, set_goal, add_subgoals
+from app.agents.agent0_intake import gen_clarifying_questions, rewrite_goal
+from app.agents.agent1_plan import decide_and_plan
+from app.agents.agent2_filter import select_docs
+from app.agents.agent2b_clean import clean_docs   # ← 新增导入
+from app.agents.agent3_write import compose_answer
+from app.retrievers.web_tavily import WebRetriever
+from app.config import get_settings
+
+def _init_ws(query: str) -> Workspace:
+    ws = Workspace(question=query)
+    save_ws(ws)
+    return ws
+
+def start_intake(query: str) -> Tuple[Workspace, List[str]]:
+    ws = _init_ws(query)
+    qs = gen_clarifying_questions(query=query, k=3)
+    save_ws(ws)
+    return ws, qs
+
+def _gather_more(ws: Workspace, dec: Decision, k: int = 8) -> Workspace:
+    try:
+        retr = WebRetriever()
+    except Exception:
+        return ws
+    all_new: List[Doc] = []
+    for sg in dec.sub_goals:
+        all_new.extend(retr.search(query=sg.query, k=k))
+    if all_new:
+        ws = add_docs(ws, all_new)
+        save_ws(ws)
+    return ws
+
+def _filter_then_clean(ws: Workspace, query: str, subquery: str | None = None, top_k: int = 8) -> List[Doc]:
+    if not ws.docs:
+        return []
+    # 保持原有行为：直接用 agent2 在 ws.docs 上筛选
+    kept = select_docs(query=query, subquery=subquery or query, docs=ws.docs, top_k=top_k)
+    # 新增最小步骤：对保留文档做逐条 LLM 清洗，覆盖 content
+    cleaned = clean_docs(docs=kept)
+    return cleaned
+
+def continue_after_answers(ws: Workspace, answers: str) -> Tuple[Workspace, str]:
+    goal = rewrite_goal(query=ws.question, user_answers=[answers])
+    ws = set_goal(ws, goal)
+
+    dec = decide_and_plan(ws=ws)
+    ws = add_subgoals(ws, dec.sub_goals)
+    save_ws(ws)
+
+    if dec.need_more:
+        ws = _gather_more(ws, dec, k=get_settings().DEFAULT_TOPK)
+
+    subq = dec.sub_goals[0].query if dec.sub_goals else ws.goal or ws.question
+    kept_cleaned = _filter_then_clean(ws, query=ws.question, subquery=subq, top_k=get_settings().DEFAULT_TOPK)
+
+    if kept_cleaned:
+        ws.docs = kept_cleaned
+        save_ws(ws)
+
+    answer = compose_answer(ws=ws)
+    return ws, answer
 app/retrievers/local_vector.py
 
 app/retrievers/rerank_sf.py
@@ -677,15 +871,20 @@ Agents
 	•	decide_and_plan(llm, ws:Workspace) -> Decision
 	•	app/agents/agent2_filter.py
 	•	select_docs(llm, query:str, subquery:str, docs:list[Doc], top_k:int=6) -> list[Doc]
+	•	**app/agents/agent2b_clean.py**
+	•	**clean_text(llm, content:str) -> str**
+	•	**clean_docs(llm, docs:list[Doc]) -> list[Doc]** （覆盖 Doc.content，meta.cleaned=true）
 	•	app/agents/agent3_write.py
 	•	compose_answer(llm, ws:Workspace) -> str
+    	•	app/agents/agent3_write.py
+	•	compose_answer(llm, ws:Workspace) -> str
+	    - 行为：基于 ws.docs 生成答案，**正文不含链接**；结尾自动追加“参考来源”列表，**逐条标注 URL**（从 ws.docs 去重后生成）
 
 Pipeline
 	•	app/pipelines/main_loop.py
-	•	init_workspace(query:str) -> Workspace
-	•	apply_user_feedback(llm, ws:Workspace, answers:list[str]) -> Workspace
-	•	gather_more(llm, ws:Workspace, retriever, rerank_model:str, k:int=8) -> Workspace
-	•	finalize_answer(llm, ws:Workspace) -> str
+	•	start_intake(query:str) -> (Workspace, list[str])
+	•	continue_after_answers(ws:Workspace, answers:str) -> (Workspace, str)
+	•	流程：改写目标 → 规划 →（可选）检索 → 筛选 → **清洗** → 写作
 make_prompt.py
 #!/usr/bin/env python3
 # make_prompt.py
@@ -870,7 +1069,7 @@ scripts/quickstart.py
 from app.pipelines.main_loop import start_intake, continue_after_answers
 
 if __name__ == "__main__":
-    query = ""
+    query = "What are the most promising approaches for reducing hallucinations in large language models, and which research groups or companies are leading this work in 2025?"
 
     # 阶段1：澄清问题
     ws, qs = start_intake(query)
