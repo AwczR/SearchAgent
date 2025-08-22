@@ -1,7 +1,7 @@
 from app.pipelines.main_loop import start_intake, continue_after_answers
 
 if __name__ == "__main__":
-    query = ""
+    query = "湖南大学工业设计专业保研的最优去处是什么？"
 
     # 阶段1：澄清问题
     ws, qs = start_intake(query)

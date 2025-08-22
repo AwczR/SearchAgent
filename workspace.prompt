@@ -1,0 +1,886 @@
+# FILE TREE
+SearchAgent
+├── app
+│   ├── agents
+│   │   ├── agent0_intake.py
+│   │   ├── agent1_plan.py
+│   │   ├── agent2_filter.py
+│   │   └── agent3_write.py
+│   ├── llm
+│   │   ├── chat_sf.py
+│   │   ├── reason_stream_sf.py
+│   │   └── stream.py
+│   ├── pipelines
+│   │   └── main_loop.py
+│   ├── retrievers
+│   │   ├── local_vector.py
+│   │   ├── rerank_sf.py
+│   │   └── web_tavily.py
+│   ├── server
+│   │   └── api.py
+│   ├── storage
+│   │   ├── fs_store.py
+│   │   └── vectorstore.py
+│   ├── tools
+│   │   ├── parse_html.py
+│   │   └── splitters.py
+│   ├── __init__.py
+│   ├── config.py
+│   ├── schema.py
+│   └── workspace.py
+├── scripts
+│   ├── quickstart.py
+│   └── run_server.sh
+├── .gitignore
+├── doc.md
+├── make_prompt.py
+├── readme.md
+└── requirements.txt
+
+.gitignore
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.pkl
+*.npy
+*.npz
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+myenv/
+*.pyenv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_save
+
+# Build / packaging
+build/
+dist/
+*.log
+*.pot
+*.pyc
+*.so
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Checkpoints / models
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Data (ignore only json, keep dir)
+data/*.json
+!data/.gitkeep
+
+# Cache
+.cache/
+*.mypy_cache/
+*.pytest_cache/
+*.coverage
+app/__init__.py
+
+app/agents/agent0_intake.py
+# app/agents/agent0_intake.py
+from typing import List
+from langchain_core.prompts import ChatPromptTemplate
+from app.llm.chat_sf import get_chat
+from app.llm.stream import stream_json
+
+QS_SCHEMA = {
+    "name": "clarify_questions",
+    "schema": {
+        "type": "object",
+        "properties": {"questions": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10}},
+        "required": ["questions"],
+        "additionalProperties": False
+    }
+}
+GOAL_SCHEMA = {
+    "name": "rewritten_goal",
+    "schema": {
+        "type": "object",
+        "properties": {"goal": {"type": "string", "minLength": 1}},
+        "required": ["goal"],
+        "additionalProperties": False
+    }
+}
+
+_QS_SYS = ""
+_QS_USER = """严格按 JSON Schema 输出。
+要求：
+- 输出为一个 JSON 对象，禁止额外文字、注释、解释。
+- 必须符合 Schema 定义，键名固定为 "questions"。
+- 每个问题不超过25字，结尾不加标点。
+- 问题不复述原题，要澄清范围、条件、限制、时间、地域、数据来源、评价标准、优先级。
+给定问题：{q}
+生成不超过{n}个澄清问题。"""
+_RW_SYS = ""
+_RW_USER = """严格按 JSON Schema 输出。
+要求：
+- 输出仅为一个 JSON 对象，禁止额外文字、注释、解释。
+- 必须符合 Schema 定义，键名固定为 "goal"。
+- 将原始问题与补充回答融合，改写为单句、清晰、可检索、可执行的目标。
+- 吸收补充内容中的约束（时间、地域、输入输出格式、评价标准、数据来源、优先级）。
+- 不虚构未提供的细节，若不足用中性占位词（如“指定数据集/时间范围”）。
+- 目标不超过50字，避免口语和感叹。
+原始问题：{q}
+补充回答：
+{a}
+改写目标："""
+
+def gen_clarifying_questions(llm=None, query: str = "", k: int = 3) -> List[str]:
+    print("[Agent0.stream] 生成澄清问题：")
+    llm = llm or get_chat()
+    prompt = ChatPromptTemplate.from_messages([("system", _QS_SYS), ("user", _QS_USER)])
+    data = stream_json(prompt.format_messages(q=query, n=k), schema=QS_SCHEMA, llm=llm)
+    return data.get("questions", [])[:k]
+
+def rewrite_goal(llm=None, query: str = "", user_answers: List[str] | None = None) -> str:
+    print("[Agent0.stream] 改写目标：")
+    llm = llm or get_chat()
+    ans = "\n".join(user_answers or [])
+    prompt = ChatPromptTemplate.from_messages([("system", _RW_SYS), ("user", _RW_USER)])
+    data = stream_json(prompt.format_messages(q=query, a=ans), schema=GOAL_SCHEMA, llm=llm)
+    return (data.get("goal") or query).strip()
+app/agents/agent1_plan.py
+# app/agents/agent1_plan.py
+from app.schema import Workspace, Decision, SubGoal
+from langchain_core.prompts import ChatPromptTemplate
+from app.llm.chat_sf import get_chat
+from app.llm.stream import stream_json
+
+PLAN_SCHEMA = {
+    "name": "plan_decision",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "need_more": {"type": "boolean"},
+            "sub_goals": {"type": "array", "items": {"type": "string"}, "maxItems": 5}
+        },
+        "required": ["need_more", "sub_goals"],
+        "additionalProperties": False
+    }
+}
+_SYS = ""
+_USER = """严格按 JSON Schema 输出，仅输出一个 JSON 对象。
+任务：根据当前 Workspace，先判断是否需要更多资料；如需要，生成多条【可一次互联网检索完成（one-shot）】的子目标查询，写入 sub_goals。
+
+约束（必须全部遵守）：
+- 语言：中文。
+- 每条 sub_goal 是【完整可直接粘贴到搜索引擎】的查询串。
+- 自包含：不得使用“这/上述/该问题”等指代；不依赖对话上下文。
+- 原子性：一次查询可获得主要答案或高置信入口；禁止多跳推理、链式步骤、合并多个问题。
+- 具体可判定：限定时间、地域、对象、版本或数据来源；避免宽泛词（如“最新”“影响”等）。
+- 可检索性增强：必要时加入运算符或提示词，如 site:、filetype:、intitle:、OR、精确短句引号等。
+- 明确信息类型：可加“定义/对比/教程/API/价格/评测/论文/代码”等词。
+- 长度 ≤ 120 字；不含标点收尾要求外的多余符号；不加解释或标签。
+- 去重与解耦：子目标之间不重复；若主题不同则拆为多条。
+- 需要对比的信息，应当分别查询数据，而不是直接查询A与B的数据对比
+
+need_more 判定准则（用于输出 need_more 的布尔值）：
+- 若 Docs count 为 0，或 Goal 含多义名词/缺少时间地域/需外部事实核验/需权威来源，则 need_more=true；
+- 若现有文档能直接回答且无需外部验证，则 need_more=false。
+
+可用上下文：
+Goal: {goal}
+Docs count: {n_docs}
+只输出 JSON。"""
+
+def decide_and_plan(llm=None, ws: Workspace = None) -> Decision:
+    print("[Agent1.stream] 规划与决策：")
+    llm = llm or get_chat()
+    prompt = ChatPromptTemplate.from_messages([("system", _SYS), ("user", _USER)])
+    data = stream_json(prompt.format_messages(goal=ws.goal or ws.question, n_docs=len(ws.docs)),
+                       schema=PLAN_SCHEMA, llm=llm)
+    subs = [SubGoal(query=q) for q in data.get("sub_goals", []) if q.strip()]
+    return Decision(need_more=bool(data.get("need_more", False)), sub_goals=subs)
+app/agents/agent2_filter.py
+# app/agents/agent2_filter.py
+import json
+from typing import List
+from langchain.prompts import ChatPromptTemplate
+from app.schema import Doc
+from app.llm.chat_sf import get_chat
+from app.llm.stream import stream_json
+
+_SYS = (
+    ""
+)
+
+_USER = (
+    "你是资料筛选助手。"
+    "输入是查询、子查询和候选资料列表。"
+    "输出要保留的资料索引（JSON）。"
+    "严格按 JSON Schema 输出，键名必须是 keep。"
+    "若全部不保留，输出 {{\"keep\": []}}。"
+    "主问题: {query}\n"
+    "子问题: {subquery}\n\n"
+    "候选资料:\n{catalog}\n\n"
+    "请输出需要保留的资料索引号码。"
+    "请只输出json"
+)
+
+KEEP_SCHEMA = {
+    "name": "doc_selection",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "keep": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0},
+                "minItems": 0,
+                "maxItems": 20,
+                "uniqueItems": True      # ✅ 索引唯一
+            }
+        },
+        "required": ["keep"],
+        "additionalProperties": False
+    }
+}
+
+
+def _mk_catalog(docs: List[Doc]) -> str:
+    """把候选文档整理成简洁的编号清单"""
+    lines = []
+    for i, d in enumerate(docs):
+        title = d.title or d.url or "untitled"
+        snippet = (d.content[:120] + "...") if len(d.content) > 120 else d.content
+        lines.append(f"[{i}] {title}\n  {snippet}")
+    return "\n".join(lines)
+
+
+def select_docs(
+    llm=None,
+    query: str = "",
+    subquery: str = "",
+    docs: List[Doc] = None,
+    top_k: int = 6
+) -> List[Doc]:
+    """调用 LLM 过滤候选文档"""
+    if not docs:
+        return []
+
+    print("[Agent2.stream] 资料筛选：")
+    llm = llm or get_chat()
+
+    catalog = _mk_catalog(docs)
+    prompt = ChatPromptTemplate.from_messages([("system", _SYS), ("user", _USER)])
+
+    # 流式 JSON 解析
+    data = stream_json(
+        prompt.format_messages(query=query, subquery=subquery, catalog=catalog),
+        schema=KEEP_SCHEMA,
+        llm=llm,
+    ) or {}
+
+    # 兼容 LLM 返回 [] 的情况，并判断是否“明确选择0条”
+    explicit_zero = False
+    if isinstance(data, list):
+        explicit_zero = (len(data) == 0)
+        data = {"keep": [i for i in data if isinstance(i, int)]}
+    elif isinstance(data, dict):
+        if "keep" not in data:
+            data = {"keep": []}
+            explicit_zero = True
+        else:
+            k = data.get("keep", [])
+            explicit_zero = isinstance(k, list) and len(k) == 0
+    else:
+        # 非法类型，视为解析失败
+        data = {"keep": None}
+
+    idxs = [i for i in (data.get("keep") or []) if isinstance(i, int) and 0 <= i < len(docs)]
+
+    # ✅ 去重并保持顺序
+    seen, uniq = set(), []
+    for i in idxs:
+        if i not in seen:
+            seen.add(i)
+            uniq.append(i)
+
+    # 若明确选择0条 → 返回空；否则沿用原逻辑
+    if uniq:
+        kept = [docs[i] for i in uniq][:top_k]
+    elif explicit_zero:
+        kept = []
+    else:
+        kept = docs[:top_k]
+
+    # 打印结果
+    if not kept:
+        print("  · 无保留文档")
+    else:
+        for i, d in enumerate(kept):
+            print(f"  · {i+1}. {d.title or d.url}  -> {d.url}")
+
+    return kept
+app/config.py
+import os
+from functools import lru_cache
+from dotenv import load_dotenv, find_dotenv
+
+# 强制从当前工作目录向上查找 .env，并覆盖系统环境
+_DOTENV_PATH = find_dotenv(filename=".env", usecwd=True)
+if not _DOTENV_PATH:
+    print("[config] WARN: .env not found from CWD")
+else:
+    print(f"[config] load .env -> {_DOTENV_PATH}")
+    load_dotenv(_DOTENV_PATH, override=True)  # 关键：override=True
+
+class Settings:
+    SF_API_KEY: str = os.getenv("SILICONFLOW_API_KEY", "").strip()
+    SF_BASE_URL: str = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1").strip()
+    SF_CHAT_MODEL: str = os.getenv("SF_CHAT_MODEL", "deepseek-ai/DeepSeek-V3").strip()
+    SF_RERANK_MODEL: str = os.getenv("SF_RERANK_MODEL", "Qwen/Qwen3-Reranker-8B").strip()
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+    TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "").strip()
+    DEFAULT_TOPK: int = int(os.getenv("DEFAULT_TOPK", "8"))
+    DATA_DIR: str = os.getenv("DATA_DIR", "data").strip()
+    SHOW_THINK: bool = os.getenv("SHOW_THINK", "1") in ("1", "true", "True")
+@lru_cache()
+def get_settings() -> "Settings":
+    s = Settings()
+    os.makedirs(s.DATA_DIR, exist_ok=True)
+    # 启动时打印关键变量前缀用于核验
+    print("[config] BASE_URL:", s.SF_BASE_URL)
+    print("[config] KEY_PREFIX:", (s.SF_API_KEY[:6] + "***") if s.SF_API_KEY else "EMPTY")
+    return s
+app/llm/chat_sf.py
+from langchain_openai import ChatOpenAI
+from app.config import get_settings
+
+def get_chat(model: str | None = None) -> ChatOpenAI:
+    s = get_settings()
+    return ChatOpenAI(
+        model=model or s.SF_CHAT_MODEL,
+        api_key=s.SF_API_KEY.strip(),
+        base_url=s.SF_BASE_URL.strip(),   # 一定要传
+        temperature=s.LLM_TEMPERATURE,
+    )
+app/llm/reason_stream_sf.py
+from typing import Iterable, Dict, Any, Optional
+from openai import OpenAI
+from app.config import get_settings
+
+def stream_reason_and_answer(
+    messages: Iterable[Dict[str, Any]],
+    model: Optional[str] = None,
+    max_tokens_reasoning: int = 4096,
+    temperature: float = 0.0,
+) -> str:
+    """
+    同时流式打印 reasoning_content（<think>）与最终 content。
+    返回最终 content 文本。
+    依赖：SILICONFLOW_BASE_URL, SILICONFLOW_API_KEY 在 .env 中设置。
+    """
+    s = get_settings()
+    client = OpenAI(api_key=s.SF_API_KEY, base_url=s.SF_BASE_URL)
+    mdl = model or s.SF_CHAT_MODEL
+
+    print("[stream] model =", mdl)
+    print("[stream] reasoning ...")
+    final_text = []
+
+    # 关键点：传 max_tokens_reasoning，推理模型才会产出 reasoning_content
+    # 文档字段名：max_tokens_reasoning（用于推理token上限）与标准 chat/completions 流式协议。 [oai_citation:2‡docs.siliconflow.com](https://docs.siliconflow.com/cn/api-reference/chat-completions/chat-completions?utm_source=chatgpt.com)
+    with client.chat.completions.stream.create(
+        model=mdl,
+        messages=list(messages),
+        temperature=temperature,
+        stream=True,
+        max_tokens_reasoning=max_tokens_reasoning,
+    ) as stream:
+        for event in stream:
+            # 推理增量
+            if event.type == "reasoning.delta":
+                chunk = event.delta or {}
+                rc = chunk.get("reasoning_content") or ""
+                if rc:
+                    print(rc, end="", flush=True)
+            # 最终推理结束
+            elif event.type == "reasoning.completed":
+                print("\n[stream] reasoning done.\n")
+            # 可见回答增量
+            elif event.type == "content.delta":
+                txt = event.delta.get("content", "")
+                if txt:
+                    print(txt, end="", flush=True)
+                    final_text.append(txt)
+            # 回答结束
+            elif event.type == "content.completed":
+                print("\n[stream] content done.\n")
+            # 其它事件类型忽略
+
+    return "".join(final_text)
+app/llm/stream.py
+# app/llm/stream.py
+import json
+from typing import Optional, Dict, Any, Iterable, List
+from app.llm.chat_sf import get_chat
+from langchain_core.messages import BaseMessage
+from app.config import get_settings
+
+def _safe_json(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except Exception:
+        s = text[text.find("{"): text.rfind("}") + 1]
+        return json.loads(s)
+
+def stream_text(messages, response_format=None, llm=None) -> str:
+    llm = llm or get_chat()
+    s = get_settings()
+
+    # A. 显示思考时开启返回开关，并给预算
+    if getattr(s, "SHOW_THINK", False):
+        llm = llm.bind(
+            extra_body={
+                "include_reasoning": True,      # 要求服务端下发思考内容
+                "thinking_budget": 1024         # 控制思考长度
+            }
+        )
+
+    # B. 展示思考时不要绑 JSON 格式
+    if response_format and not getattr(s, "SHOW_THINK", False):
+        llm = llm.bind(response_format=response_format)
+
+    buf = []
+    for chunk in llm.stream(messages):
+        if getattr(s, "SHOW_THINK", False):
+            rc = (getattr(chunk, "additional_kwargs", {}) or {}).get("reasoning_content") or ""
+
+            # 兜底：从原始增量里拿
+            if not rc:
+                meta = getattr(chunk, "response_metadata", {}) or {}
+                delta = (meta.get("delta") or {})
+                if not delta:
+                    raw = meta.get("raw") or {}
+                    choices = raw.get("choices") or []
+                    delta = (choices[0].get("delta") if choices else {}) or {}
+                rc = delta.get("reasoning_content") or ""
+
+            if rc:
+                print(rc, end="", flush=True)
+
+        part = getattr(chunk, "content", "") or ""
+        if part:
+            print(part, end="", flush=True)
+            buf.append(part)
+
+    print()
+    return "".join(buf)
+
+def stream_json(messages: Iterable[BaseMessage], schema: Optional[Dict[str, Any]] = None, llm=None) -> dict:
+    text = stream_text(
+        messages,
+        response_format=({"type": "json_schema", "json_schema": schema} if schema else {"type": "json_object"}),
+        llm=llm,
+    )
+    return _safe_json(text)
+app/retrievers/local_vector.py
+
+app/retrievers/rerank_sf.py
+from typing import List
+import httpx
+from app.schema import Doc
+from app.config import get_settings
+
+def rerank(query: str, docs: List[Doc], model: str | None = None) -> List[Doc]:
+    """Call SiliconFlow rerank adapter (OpenAI-style). Assumes /v1/rerank."""
+    s = get_settings()
+    _model = model or s.SF_RERANK_MODEL
+    payload = {
+        "model": _model,
+        "query": query,
+        "documents": [d.content for d in docs],
+        "return_documents": False
+    }
+    headers = {"Authorization": f"Bearer {s.SF_API_KEY}"}
+    url = f"{s.SF_BASE_URL.rstrip('/')}/rerank"
+    with httpx.Client(timeout=60) as client:
+        r = client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    # Expect scores aligned to input order or ranked indices
+    scored = data.get("results") or []
+    # results: [{"index": int, "relevance_score": float}, ...]
+    ordered = []
+    for item in sorted(scored, key=lambda x: x.get("relevance_score", 0), reverse=True):
+        idx = item.get("index")
+        d = docs[idx]
+        d.score = float(item.get("relevance_score", 0))
+        ordered.append(d)
+    return ordered
+app/retrievers/web_tavily.py
+from typing import List
+from tavily import TavilyClient
+from app.schema import Doc
+from app.config import get_settings
+
+class WebRetriever:
+    def __init__(self):
+        s = get_settings()
+        if not s.TAVILY_API_KEY:
+            raise RuntimeError("TAVILY_API_KEY missing")
+        self.client = TavilyClient(api_key=s.TAVILY_API_KEY)
+
+    def search(self, query: str, k: int = 8) -> List[Doc]:
+        res = self.client.search(query=query, max_results=k, include_raw_content=True, include_answer=False)
+        docs: List[Doc] = []
+        for i, item in enumerate(res.get("results", [])):
+            content = item.get("raw_content") or item.get("content") or ""
+            docs.append(Doc(
+                title=item.get("title") or "",
+                url=item.get("url") or "",
+                content=content,
+                source="tavily",
+                meta={"score": item.get("score"), "position": i}
+            ))
+        return docs
+app/schema.py
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict
+from datetime import datetime
+import uuid
+
+def _id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+class Doc(BaseModel):
+    id: str = Field(default_factory=lambda: _id("doc"))
+    title: Optional[str] = None
+    url: Optional[str] = None
+    content: str
+    score: Optional[float] = None
+    source: Optional[str] = None
+    meta: Dict = Field(default_factory=dict)
+
+class SubGoal(BaseModel):
+    id: str = Field(default_factory=lambda: _id("sub"))
+    query: str
+    status: str = "pending"
+
+class Workspace(BaseModel):
+    id: str = Field(default_factory=lambda: _id("ws"))
+    question: str
+    goal: Optional[str] = None
+    docs: List[Doc] = Field(default_factory=list)
+    sub_goals: List[SubGoal] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Decision(BaseModel):
+    need_more: bool
+    sub_goals: List[SubGoal] = Field(default_factory=list)
+app/server/api.py
+
+app/storage/fs_store.py
+
+app/storage/vectorstore.py
+
+app/tools/parse_html.py
+
+app/tools/splitters.py
+
+app/workspace.py
+import json
+import os
+from typing import List
+from datetime import datetime
+from app.schema import Workspace, Doc, SubGoal
+from app.config import get_settings
+
+def _path(ws_id: str) -> str:
+    s = get_settings()
+    return os.path.join(s.DATA_DIR, f"{ws_id}.json")
+
+def load_ws(ws_id: str) -> Workspace:
+    p = _path(ws_id)
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return Workspace(**data)
+
+def save_ws(ws: Workspace) -> None:
+    ws.updated_at = datetime.utcnow()
+    p = _path(ws.id)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(
+            ws.model_dump(mode="json"),  # ✅ 用 Pydantic 的 JSON 模式
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+def add_docs(ws: Workspace, docs: List[Doc]) -> Workspace:
+    ws.docs.extend(docs)
+    return ws
+
+def set_goal(ws: Workspace, goal: str) -> Workspace:
+    ws.goal = goal
+    return ws
+
+def add_subgoals(ws: Workspace, subs: List[SubGoal]) -> Workspace:
+    ws.sub_goals.extend(subs)
+    return ws
+doc.md
+.模块边界与接口
+
+数据与持久化
+	•	app/schema.py
+	•	Doc: {id,title,url,content,score,source,meta}
+	•	SubGoal: {id,query,status}
+	•	Workspace: {id,question,goal,docs:list[Doc],sub_goals:list[SubGoal],created_at,updated_at}
+	•	Decision: {need_more: bool, sub_goals: list[SubGoal]}
+	•	app/workspace.py
+	•	load_ws(ws_id:str) -> Workspace
+	•	save_ws(ws:Workspace) -> None
+	•	add_docs(ws:Workspace, docs:list[Doc]) -> Workspace
+	•	set_goal(ws:Workspace, goal:str) -> Workspace
+	•	add_subgoals(ws:Workspace, subs:list[SubGoal]) -> Workspace
+
+基础设施
+	•	app/config.py
+	•	Settings: 读取 .env
+	•	get_settings() -> Settings 单例
+	•	app/llm/chat_sf.py
+	•	get_chat(model:str) -> ChatOpenAI 通过 OpenAI 兼容协议直连 SiliconFlow
+	•	get_embed(model:str) -> OpenAIEmbeddings 同上
+	•	app/retrievers/web_tavily.py
+	•	WebRetriever.search(query:str,k:int=8) -> list[Doc]
+	•	app/retrievers/rerank_sf.py
+	•	rerank(query:str, docs:list[Doc], model:str) -> list[Doc] 按得分降序返回
+
+Agents
+	•	app/agents/agent0_intake.py
+	•	gen_clarifying_questions(llm, query:str, k:int=3) -> list[str]
+	•	rewrite_goal(llm, query:str, user_answers:list[str]) -> str
+	•	app/agents/agent1_plan.py
+	•	decide_and_plan(llm, ws:Workspace) -> Decision
+	•	app/agents/agent2_filter.py
+	•	select_docs(llm, query:str, subquery:str, docs:list[Doc], top_k:int=6) -> list[Doc]
+	•	app/agents/agent3_write.py
+	•	compose_answer(llm, ws:Workspace) -> str
+
+Pipeline
+	•	app/pipelines/main_loop.py
+	•	init_workspace(query:str) -> Workspace
+	•	apply_user_feedback(llm, ws:Workspace, answers:list[str]) -> Workspace
+	•	gather_more(llm, ws:Workspace, retriever, rerank_model:str, k:int=8) -> Workspace
+	•	finalize_answer(llm, ws:Workspace) -> str
+make_prompt.py
+#!/usr/bin/env python3
+# make_prompt.py
+from __future__ import annotations
+import os, sys, subprocess, io
+from pathlib import Path
+from typing import Iterable, List, Set, Tuple
+
+ROOT = Path.cwd()
+OUTFILE = ROOT / "workspace.prompt"
+GITIGNORE = ROOT / ".gitignore"
+
+def has_git_repo() -> bool:
+    return (ROOT / ".git").exists()
+
+def load_pathspec():
+    try:
+        import pathspec  # type: ignore
+        spec = None
+        if GITIGNORE.exists():
+            with GITIGNORE.open("r", encoding="utf-8") as f:
+                spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, f)
+        return spec
+    except Exception:
+        return None
+
+def list_files_with_git() -> List[Path]:
+    # all tracked + untracked, excluding ignored by .gitignore/.git/info/exclude/global excludes
+    cmd = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+    try:
+        out = subprocess.check_output(cmd, cwd=ROOT)
+        rels = [Path(p) for p in out.decode("utf-8", "ignore").split("\x00") if p]
+        return [ROOT / p for p in rels]
+    except Exception:
+        return []
+
+def list_files_with_pathspec(spec) -> List[Path]:
+    files: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT, topdown=True):
+        # prune .git early
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            p = Path(dirpath) / name
+            rel = p.relative_to(ROOT).as_posix()
+            if spec and spec.match_file(rel):
+                continue
+            files.append(p)
+    return files
+
+def list_all_files_fallback() -> List[Path]:
+    files: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT, topdown=True):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            files.append(Path(dirpath) / name)
+    return files
+
+def is_probably_text(path: Path, blocksize: int = 4096) -> bool:
+    try:
+        with open(path, "rb") as f:
+            b = f.read(blocksize)
+        if b == b"":
+            return True
+        # Heuristic: no NUL bytes, decodable as UTF-8 (with small error rate)
+        if b"\x00" in b:
+            return False
+        try:
+            b.decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            # allow if most bytes are ASCII
+            ascii_ratio = sum(1 for x in b if 9 <= x <= 127) / max(1, len(b))
+            return ascii_ratio > 0.9
+    except Exception:
+        return False
+
+def render_tree(paths: Iterable[Path]) -> str:
+    rels = sorted([p.relative_to(ROOT) for p in paths], key=lambda p: p.as_posix())
+    # Build a directory tree map
+    tree = {}
+    for r in rels:
+        parts = r.parts
+        cur = tree
+        for i, part in enumerate(parts):
+            key = ("F", part) if i == len(parts)-1 and not (ROOT / r).is_dir() else ("D", part)
+            cur = cur.setdefault(key, {})
+    lines: List[str] = []
+    def walk(node, prefix=""):
+        items = sorted(node.items(), key=lambda kv: (kv[0][0], kv[0][1].lower()))
+        for i, ((kind, name), child) in enumerate(items):
+            connector = "└── " if i == len(items)-1 else "├── "
+            lines.append(prefix + connector + name)
+            if child:
+                new_prefix = prefix + ("    " if i == len(items)-1 else "│   ")
+                walk(child, new_prefix)
+    lines.insert(0, ROOT.name)
+    walk(tree, "")
+    return "\n".join(lines)
+
+def main():
+    # 1) decide file set using best available method
+    files: List[Path] = []
+    if has_git_repo():
+        files = list_files_with_git()
+    if not files:
+        spec = load_pathspec()
+        if spec:
+            files = list_files_with_pathspec(spec)
+        else:
+            files = list_all_files_fallback()
+
+    # Exclude the output file itself and obvious binary blobs by extension
+    skip_ext = {
+        ".png",".jpg",".jpeg",".webp",".gif",".bmp",".ico",".svg",
+        ".pdf",".zip",".tar",".gz",".xz",".7z",".rar",
+        ".mp3",".wav",".flac",".aac",".mp4",".mov",".mkv",".avi",
+        ".ttf",".otf",".woff",".woff2",".psd",".ai",".pptx",".docx",".xlsx",
+        ".pt",".bin",".npy",".npz",".so",".dylib",".dll",
+    }
+    files = [p for p in files if p.is_file() and p.resolve() != OUTFILE.resolve() and p.suffix.lower() not in skip_ext]
+
+    # 2) produce file tree using included files plus their parent dirs
+    tree_sources = set()
+    for p in files:
+        q = p
+        while True:
+            tree_sources.add(q)
+            if q.parent == ROOT or q.parent == q:
+                tree_sources.add(q.parent)
+                break
+            q = q.parent
+    tree_text = render_tree([q for q in tree_sources if q.exists()])
+
+    # 3) write output
+    with io.open(OUTFILE, "w", encoding="utf-8", newline="\n") as out:
+        out.write("# FILE TREE\n")
+        out.write(tree_text)
+        out.write("\n\n")
+        for path in sorted(files, key=lambda x: x.relative_to(ROOT).as_posix()):
+            rel = path.relative_to(ROOT).as_posix()
+            if not is_probably_text(path):
+                continue
+            out.write(rel + "\n")
+            try:
+                with io.open(path, "r", encoding="utf-8", errors="replace") as f:
+                    out.write(f.read())
+            except Exception as e:
+                out.write(f"[UNREADABLE: {e}]\n")
+            out.write("\n")  # separator between files
+
+    print(f"Wrote {OUTFILE}")
+
+if __name__ == "__main__":
+    main()
+requirements.txt
+python-dotenv
+pydantic>=2
+fastapi 
+uvicorn
+
+langchain>=0.2
+langchain-openai
+langchain-core>=0.2
+langchain-community>=0.2
+langchain-siliconflow>=0.1.0    # 官方集成包  [oai_citation:7‡python.langchain.com](https://python.langchain.com/docs/integrations/providers/siliconflow/?utm_source=chatgpt.com) [oai_citation:8‡piwheels.org](https://www.piwheels.org/project/langchain-siliconflow?utm_source=chatgpt.com)
+
+httpx>=0.27
+
+# 外部搜索（至少选一个）
+tavily-python            # Tavily SDK  [oai_citation:9‡docs.tavily.com](https://docs.tavily.com/?utm_source=chatgpt.com)          # Jina Search/Reader  [oai_citation:12‡Jina AI](https://jina.ai/reader/?utm_source=chatgpt.com)
+
+# 向量库（选一）
+faiss-cpu
+# 或
+qdrant-client
+
+# 解析与清洗
+beautifulsoup4 
+lxml
+tiktoken
+scripts/quickstart.py
+from app.pipelines.main_loop import start_intake, continue_after_answers
+
+if __name__ == "__main__":
+    query = ""
+
+    # 阶段1：澄清问题
+    ws, qs = start_intake(query)
+    print("澄清问题：", qs)
+
+    # 等待更多信息
+    answers = input()
+
+    # 阶段2：带回答继续
+    ws, answer = continue_after_answers(ws, answers)
+    print("\n=== 最终回答 ===\n", answer)
+scripts/run_server.sh
+

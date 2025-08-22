@@ -33,12 +33,17 @@ Agents
 	•	decide_and_plan(llm, ws:Workspace) -> Decision
 	•	app/agents/agent2_filter.py
 	•	select_docs(llm, query:str, subquery:str, docs:list[Doc], top_k:int=6) -> list[Doc]
+	•	**app/agents/agent2b_clean.py**
+	•	**clean_text(llm, content:str) -> str**
+	•	**clean_docs(llm, docs:list[Doc]) -> list[Doc]** （覆盖 Doc.content，meta.cleaned=true）
 	•	app/agents/agent3_write.py
 	•	compose_answer(llm, ws:Workspace) -> str
+    	•	app/agents/agent3_write.py
+	•	compose_answer(llm, ws:Workspace) -> str
+	    - 行为：基于 ws.docs 生成答案，**正文不含链接**；结尾自动追加“参考来源”列表，**逐条标注 URL**（从 ws.docs 去重后生成）
 
 Pipeline
 	•	app/pipelines/main_loop.py
-	•	init_workspace(query:str) -> Workspace
-	•	apply_user_feedback(llm, ws:Workspace, answers:list[str]) -> Workspace
-	•	gather_more(llm, ws:Workspace, retriever, rerank_model:str, k:int=8) -> Workspace
-	•	finalize_answer(llm, ws:Workspace) -> str
+	•	start_intake(query:str) -> (Workspace, list[str])
+	•	continue_after_answers(ws:Workspace, answers:str) -> (Workspace, str)
+	•	流程：改写目标 → 规划 →（可选）检索 → 筛选 → **清洗** → 写作

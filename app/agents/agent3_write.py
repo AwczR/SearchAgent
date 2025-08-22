@@ -1,121 +1,87 @@
 # app/agents/agent3_write.py
-from typing import List
+from __future__ import annotations
+from typing import List, Tuple
 from langchain_core.prompts import ChatPromptTemplate
 from app.llm.chat_sf import get_chat
-from app.llm.stream import stream_json
+from app.llm.stream import stream_text
 from app.schema import Workspace, Doc
 
-# 兼容两种格式：int 或 {"doc_index": int, ...}
-ANSWER_SCHEMA = {
-    "name": "final_answer",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "answer": {"type": "string", "minLength": 1},
-            "citations": {
-                "type": "array",
-                "items": {
-                    "oneOf": [
-                        {"type": "integer", "minimum": 0},
-                        {
-                            "type": "object",
-                            "properties": {
-                                "doc_index": {"type": "integer", "minimum": 0},
-                                "evidence": {"type": "string"}
-                            },
-                            "required": ["doc_index"],
-                            "additionalProperties": False
-                        }
-                    ]
-                }
-            }
-        },
-        "required": ["answer", "citations"],
-        "additionalProperties": False
-    }
-}
-
 _SYS = ""
-_USER = (
-    """
-        你是一个严谨的学术研究写作者，擅长撰写高水平论文。  
-        请你根据以下要求写作：  
+_USER = """你将基于“候选资料片段”回答“用户问题”。要求：
+- 直接给出答案，不要解释流程。
+- 不要在正文里写“参考文献/来源/链接”等字样。
+- 不要在正文里输出 URL，正文结束后我会自动附上来源列表。
 
-        1. 保持学术写作风格：  
-        - 语言正式、客观、中立  
-        - 逻辑清晰，论点有证据支持  
-        - 段落结构完整，每段有中心思想  
-        - 内容饱满丰富
+用户问题：
+{question}
 
-        2. 内容要素：  
-        - 有一个明确的研究主题或问题   
-        - 用最适合主题的方式去书写  
+若有目标：
+{goal}
 
-        3. 写作要求：  
-        - 必须分段，层次分明    
-        - 语言流畅，避免口语化  
-         """
-    "严格按 JSON Schema 输出，answer 为成文论文。citations 使用0基索引。"
-    "主问题：{q}\n目标：{g}\n\n资料（带索引，从0计数）：\n{ctx}\n\n请输出 answer 与 citations。"
-)
+候选资料片段（可能已被清洗，仅供作答，不要原样粘贴长段）：
+{contexts}
+"""
 
-def _mk_context(docs: List[Doc], max_chars: int = 1000) -> str:
-    rows = []
-    for i, d in enumerate(docs):
-        head = d.title or d.url or d.id
-        body = (d.content or "")[:max_chars].replace("\n", " ")
-        rows.append(f"[{i}] {head}\n{body}")
-    return "\n\n".join(rows)
-
-def _normalize_citations(cites, n_docs: int) -> list[int]:
-    if not isinstance(cites, list):
-        return []
-    out = []
-    for c in cites:
-        if isinstance(c, int):
-            idx = c
-        elif isinstance(c, dict):
-            idx = c.get("doc_index")
-        else:
+def _mk_context(docs: List[Doc], max_chars_per_doc: int = 1200, max_docs: int = 8) -> Tuple[str, List[Doc]]:
+    """把文档裁剪成可读片段，并返回用于展示的 doc 列表（保持顺序、去重 URL）"""
+    seen = set()
+    ordered: List[Doc] = []
+    for d in docs:
+        u = (d.url or "").strip()
+        key = u or d.id
+        if key in seen:
             continue
-        if isinstance(idx, int) and 0 <= idx < n_docs:
-            out.append(idx)
-    return sorted(dict.fromkeys(out))
+        seen.add(key)
+        ordered.append(d)
+        if len(ordered) >= max_docs:
+            break
 
-def _format_references(docs: List[Doc], idxs: List[int]) -> str:
     lines = []
-    for i in idxs:
-        d = docs[i]
+    for i, d in enumerate(ordered, 1):
+        title = d.title or (d.url or "untitled")
+        url = d.url or "(no url)"
+        body = (d.content or "").strip()
+        if len(body) > max_chars_per_doc:
+            body = body[:max_chars_per_doc].rstrip() + " ..."
+        lines.append(f"[{i}] {title}\nURL: {url}\n{body}\n")
+    return "\n".join(lines), ordered
+
+def _mk_refs(docs: List[Doc]) -> str:
+    """生成参考来源列表，带 URL。只展示有 URL 的条目。"""
+    refs = []
+    seen = set()
+    for i, d in enumerate(docs, 1):
+        title = d.title or d.url or "untitled"
         url = (d.url or "").strip()
         if not url:
             continue
-        title = (d.title or d.id or "untitled").strip()
-        lines.append(f"- [{i+1}] {title} -> {url}")
-    return "\n".join(lines)
+        if url in seen:
+            continue
+        seen.add(url)
+        refs.append(f"{i}. [{title}]({url})")
+    if not refs:
+        return ""
+    return "\n\n参考来源：\n" + "\n".join(refs) + "\n"
 
-def _attach_citations_and_sources(answer: str, cites_any, docs: List[Doc]) -> str:
-    idxs = _normalize_citations(cites_any, len(docs))
-    if not idxs:
-        return answer
-    # 文内标注
-    marks = " ".join(f"[{i+1}]" for i in idxs)
-    out = f"{answer}\n\n参考：{marks}"
-    # 追加来源网址
-    refs = _format_references(docs, idxs)
-    if refs:
-        out += f"\n\n来源：\n{refs}"
-    return out
-
-def compose_answer(llm=None, ws: Workspace = None) -> str:
-    print("[Agent3.stream] 生成最终回答：")
+def compose_answer(llm=None, ws: Workspace | None = None) -> str:
+    if ws is None:
+        return "错误：Workspace 为空。"
     llm = llm or get_chat()
-    ctx = _mk_context(ws.docs)
+
+    # 组装上下文
+    contexts, used_docs = _mk_context(ws.docs or [])
+
+    # 调用 LLM 生成正文
     prompt = ChatPromptTemplate.from_messages([("system", _SYS), ("user", _USER)])
-    data = stream_json(
-        prompt.format_messages(q=ws.question, g=ws.goal or "", ctx=ctx),
-        schema=ANSWER_SCHEMA,
-        llm=llm
-    )
-    ans = (data.get("answer") or "").strip()
-    cites = data.get("citations") or []
-    return _attach_citations_and_sources(ans, cites, ws.docs) if ans else "（无有效回答）"
+    body = stream_text(
+        prompt.format_messages(
+            question=ws.question,
+            goal=ws.goal or "(未设定)",
+            contexts=contexts or "(无)"
+        ),
+        llm=llm,
+    ).strip()
+
+    # 追加参考来源（只放 URL，不参与 LLM）
+    refs = _mk_refs(used_docs)
+    return body + (refs if refs else "")
