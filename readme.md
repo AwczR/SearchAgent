@@ -31,6 +31,8 @@ TAVILY_API_KEY=你的API密钥   # 可选，启用网页检索
 ## 使用
 
 ### 方式一：快速交互
+
+在```scripts/quickstart.py```中填写```query```：```query = "你的问题"```
 ```bash
 python scripts/quickstart.py
 ```
